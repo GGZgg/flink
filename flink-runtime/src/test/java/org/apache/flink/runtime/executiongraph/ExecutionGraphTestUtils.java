@@ -35,9 +35,9 @@ import org.apache.flink.runtime.scheduler.SchedulerBase;
 import org.apache.flink.runtime.scheduler.SchedulerTestingUtils;
 import org.apache.flink.runtime.scheduler.strategy.ConsumedPartitionGroup;
 import org.apache.flink.runtime.scheduler.strategy.ExecutionVertexID;
-import org.apache.flink.runtime.testingUtils.TestingUtils;
 import org.apache.flink.runtime.testtasks.NoOpInvokable;
 import org.apache.flink.runtime.testutils.DirectScheduledExecutorService;
+import org.apache.flink.runtime.testutils.TestingUtils;
 
 import javax.annotation.Nullable;
 
@@ -235,6 +235,7 @@ public class ExecutionGraphTestUtils {
      */
     public static void switchAllVerticesToRunning(ExecutionGraph eg) {
         for (ExecutionVertex vertex : eg.getAllExecutionVertices()) {
+            vertex.getCurrentExecutionAttempt().switchToRecovering();
             vertex.getCurrentExecutionAttempt().switchToRunning();
         }
     }
@@ -335,7 +336,6 @@ public class ExecutionGraphTestUtils {
                         .setJobGraph(JobGraphTestUtils.streamingJobGraph(vertices))
                         .setFutureExecutor(executor)
                         .setIoExecutor(executor)
-                        .setAllocationTimeout(timeout)
                         .setRpcTimeout(timeout)
                         .build();
         executionGraph.start(ComponentMainThreadExecutorServiceAdapter.forMainThread());
@@ -347,9 +347,14 @@ public class ExecutionGraphTestUtils {
     }
 
     public static JobVertex createNoOpVertex(String name, int parallelism) {
+        return createNoOpVertex(name, parallelism, JobVertex.MAX_PARALLELISM_DEFAULT);
+    }
+
+    public static JobVertex createNoOpVertex(String name, int parallelism, int maxParallelism) {
         JobVertex vertex = new JobVertex(name);
         vertex.setInvokableClass(NoOpInvokable.class);
         vertex.setParallelism(parallelism);
+        vertex.setMaxParallelism(maxParallelism);
         return vertex;
     }
 
@@ -501,12 +506,14 @@ public class ExecutionGraphTestUtils {
                 assertEquals(inputJobVertices.size(), ev.getNumberOfInputs());
 
                 for (int i = 0; i < inputJobVertices.size(); i++) {
-                    ConsumedPartitionGroup consumedPartitions = ev.getConsumedPartitions(i);
+                    ConsumedPartitionGroup consumedPartitionGroup = ev.getConsumedPartitionGroup(i);
                     assertEquals(
-                            inputJobVertices.get(i).getParallelism(), consumedPartitions.size());
+                            inputJobVertices.get(i).getParallelism(),
+                            consumedPartitionGroup.size());
 
                     int expectedPartitionNum = 0;
-                    for (IntermediateResultPartitionID consumedPartitionId : consumedPartitions) {
+                    for (IntermediateResultPartitionID consumedPartitionId :
+                            consumedPartitionGroup) {
                         assertEquals(
                                 expectedPartitionNum, consumedPartitionId.getPartitionNumber());
 

@@ -171,7 +171,7 @@ SqlDescribeDatabase SqlDescribeDatabase() :
     boolean isExtended = false;
 }
 {
-    <DESCRIBE> ( <DATABASE> | <SCHEMA> ) { pos = getPos();}
+    ( <DESCRIBE> | <DESC> ) ( <DATABASE> | <SCHEMA> ) { pos = getPos();}
     [ <EXTENDED> { isExtended = true;} ]
     databaseName = CompoundIdentifier()
     {
@@ -263,7 +263,7 @@ SqlRichDescribeTable SqlRichDescribeTable() :
     boolean formatted = false;
 }
 {
-    <DESCRIBE> { pos = getPos();}
+    ( <DESCRIBE> | <DESC> ) { pos = getPos();}
     [ LOOKAHEAD(2)
       ( <EXTENDED> { extended = true; }
         |
@@ -1090,7 +1090,7 @@ SqlDescribeCatalog SqlDescribeCatalog() :
     SqlParserPos pos;
 }
 {
-    <DESCRIBE> <CATALOG> { pos = getPos();}
+    ( <DESCRIBE> | <DESC> ) <CATALOG> { pos = getPos();}
     catalogName = SimpleIdentifier()
     {
         return new SqlDescribeCatalog(pos, catalogName);
@@ -1603,5 +1603,75 @@ SqlShowModules SqlShowModules() :
     <MODULES>
     {
         return new SqlShowModules(startPos.plus(getPos()), requireFull);
+    }
+}
+
+/**
+* Parses a explain module statement.
+*/
+SqlNode SqlRichExplain() :
+{
+    SqlNode stmt;
+}
+{
+    <EXPLAIN> [ <PLAN> <FOR> ]
+    (
+        stmt = OrderedQueryOrExpr(ExprContext.ACCEPT_QUERY)
+        |
+        stmt = RichSqlInsert()
+    )
+    {
+        return new SqlRichExplain(getPos(), stmt);
+    }
+}
+
+/**
+* Parses an ADD JAR statement.
+*/
+SqlAddJar SqlAddJar() :
+{
+    SqlCharStringLiteral jarPath;
+}
+{
+    <ADD> <JAR> <QUOTED_STRING>
+    {
+        String path = SqlParserUtil.parseString(token.image);
+        jarPath = SqlLiteral.createCharString(path, getPos());
+    }
+    {
+        return new SqlAddJar(getPos(), jarPath);
+    }
+}
+
+/**
+* Parses a remove jar statement.
+* REMOVE JAR jar_path;
+*/
+SqlRemoveJar SqlRemoveJar() :
+{
+    SqlCharStringLiteral jarPath;
+}
+{
+    <REMOVE> <JAR> <QUOTED_STRING>
+    {
+        String path = SqlParserUtil.parseString(token.image);
+        jarPath = SqlLiteral.createCharString(path, getPos());
+    }
+    {
+        return new SqlRemoveJar(getPos(), jarPath);
+    }
+}
+
+/**
+* Parses a show jars statement.
+* SHOW JARS;
+*/
+SqlShowJars SqlShowJars() :
+{
+}
+{
+    <SHOW> <JARS>
+    {
+        return new SqlShowJars(getPos());
     }
 }

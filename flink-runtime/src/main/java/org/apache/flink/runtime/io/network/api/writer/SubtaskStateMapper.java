@@ -54,18 +54,6 @@ public enum SubtaskStateMapper {
         }
     },
 
-    /**
-     * Discards extra state. Useful if all subtasks already contain the same information
-     * (broadcast).
-     */
-    DISCARD_EXTRA_STATE {
-        @Override
-        public int[] getOldSubtasks(
-                int newSubtaskIndex, int oldNumberOfSubtasks, int newNumberOfSubtasks) {
-            return newSubtaskIndex >= oldNumberOfSubtasks ? EMPTY : new int[] {newSubtaskIndex};
-        }
-    },
-
     /** Restores extra subtasks to the first subtask. */
     FIRST {
         @Override
@@ -182,6 +170,17 @@ public enum SubtaskStateMapper {
                 subtasks.add(subtask);
             }
             return subtasks.toArray();
+        }
+    },
+
+    UNSUPPORTED {
+        @Override
+        public int[] getOldSubtasks(
+                int newSubtaskIndex, int oldNumberOfSubtasks, int newNumberOfSubtasks) {
+            throw new UnsupportedOperationException(
+                    "Cannot rescale the given pointwise partitioner.\n"
+                            + "Did you change the partitioner to forward or rescale?\n"
+                            + "It may also help to add an explicit shuffle().");
         }
     };
 

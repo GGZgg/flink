@@ -37,6 +37,7 @@ import org.apache.flink.table.planner.plan.abilities.source.LimitPushDownSpec;
 import org.apache.flink.table.planner.plan.abilities.source.PartitionPushDownSpec;
 import org.apache.flink.table.planner.plan.abilities.source.ProjectPushDownSpec;
 import org.apache.flink.table.planner.plan.abilities.source.ReadingMetadataSpec;
+import org.apache.flink.table.planner.plan.abilities.source.SourceWatermarkSpec;
 import org.apache.flink.table.planner.plan.abilities.source.WatermarkPushDownSpec;
 import org.apache.flink.table.planner.plan.nodes.exec.spec.DynamicTableSourceSpec;
 import org.apache.flink.table.types.logical.BigIntType;
@@ -116,11 +117,7 @@ public class DynamicTableSourceSpecSerdeTest {
         actual.setReadableConfig(serdeCtx.getConfiguration());
         TableEnvironmentImpl tableEnv =
                 (TableEnvironmentImpl)
-                        TableEnvironment.create(
-                                EnvironmentSettings.newInstance()
-                                        .inStreamingMode()
-                                        .useBlinkPlanner()
-                                        .build());
+                        TableEnvironment.create(EnvironmentSettings.inStreamingMode());
         assertNotNull(actual.getScanTableSource((PlannerBase) tableEnv.getPlanner()));
     }
 
@@ -236,6 +233,14 @@ public class DynamicTableSourceSpecSerdeTest {
                                                                 TimeUnit.SECOND,
                                                                 SqlParserPos.ZERO))),
                                         5000,
+                                        RowType.of(
+                                                new BigIntType(),
+                                                new IntType(),
+                                                new IntType(),
+                                                new TimestampType(
+                                                        false, TimestampKind.ROWTIME, 3))),
+                                new SourceWatermarkSpec(
+                                        true,
                                         RowType.of(
                                                 new BigIntType(),
                                                 new IntType(),

@@ -25,6 +25,7 @@ import org.apache.flink.api.common.typeutils.base.IntSerializer;
 import org.apache.flink.client.program.ClusterClient;
 import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.StateBackendOptions;
 import org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend.PriorityQueueStateType;
 import org.apache.flink.contrib.streaming.state.RocksDBOptions;
 import org.apache.flink.core.testutils.OneShotLatch;
@@ -54,11 +55,12 @@ import java.net.URL;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import static org.apache.flink.runtime.testutils.CommonTestUtils.waitForAllTaskRunning;
+
 /** Tests for restoring {@link PriorityQueueStateType#HEAP} timers stored in raw operator state. */
 public class TimersSavepointITCase {
     private static final int PARALLELISM = 4;
 
-    private static final OneShotLatch savepointLatch = new OneShotLatch();
     private static final OneShotLatch resultLatch = new OneShotLatch();
 
     @ClassRule public static final TemporaryFolder TMP_FOLDER = new TemporaryFolder();
@@ -117,7 +119,7 @@ public class TimersSavepointITCase {
     private void takeSavepoint(String savepointPath, ClusterClient<?> client) throws Exception {
         JobGraph jobGraph = getJobGraph(PriorityQueueStateType.ROCKSDB);
         client.submitJob(jobGraph).get();
-        savepointLatch.await();
+        waitForAllTaskRunning(miniClusterResource.getMiniCluster(), jobGraph.getJobID());
         CompletableFuture<String> savepointPathFuture =
                 client.triggerSavepoint(jobGraph.getJobID(), null);
 
@@ -140,7 +142,7 @@ public class TimersSavepointITCase {
                 .addSink(new DiscardingSink<>());
 
         final Configuration config = new Configuration();
-        config.set(CheckpointingOptions.STATE_BACKEND, "rocksdb");
+        config.set(StateBackendOptions.STATE_BACKEND, "rocksdb");
         config.set(
                 CheckpointingOptions.CHECKPOINTS_DIRECTORY,
                 TMP_FOLDER.newFolder().toURI().toString());
@@ -215,7 +217,6 @@ public class TimersSavepointITCase {
                 throws Exception {
             if (value == 0) {
                 ctx.timerService().registerEventTimeTimer(2L);
-                savepointLatch.trigger();
             }
         }
 

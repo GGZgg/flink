@@ -18,6 +18,7 @@
 
 package org.apache.flink.connectors.hive;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.serialization.BulkWriter;
 import org.apache.flink.configuration.ReadableConfig;
@@ -45,7 +46,7 @@ import org.apache.flink.table.catalog.hive.client.HiveMetastoreClientFactory;
 import org.apache.flink.table.catalog.hive.client.HiveMetastoreClientWrapper;
 import org.apache.flink.table.catalog.hive.client.HiveShim;
 import org.apache.flink.table.catalog.hive.client.HiveShimLoader;
-import org.apache.flink.table.catalog.hive.descriptors.HiveCatalogValidator;
+import org.apache.flink.table.catalog.hive.factories.HiveCatalogFactoryOptions;
 import org.apache.flink.table.catalog.hive.util.HiveReflectionUtils;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.sink.DataStreamSinkProvider;
@@ -129,7 +130,7 @@ public class HiveTableSink implements DynamicTableSink, SupportsPartitioning, Su
         this.catalogTable = table;
         hiveVersion =
                 Preconditions.checkNotNull(
-                        jobConf.get(HiveCatalogValidator.CATALOG_HIVE_VERSION),
+                        jobConf.get(HiveCatalogFactoryOptions.HIVE_VERSION.key()),
                         "Hive version is not defined");
         hiveShim = HiveShimLoader.loadHiveShim(hiveVersion);
         tableSchema = TableSchemaUtils.getPhysicalSchema(table.getSchema());
@@ -318,7 +319,13 @@ public class HiveTableSink implements DynamicTableSink, SupportsPartitioning, Su
                             parallelism);
         } else {
             writerStream =
-                    StreamingSink.writer(dataStream, bucketCheckInterval, builder, parallelism);
+                    StreamingSink.writer(
+                            dataStream,
+                            bucketCheckInterval,
+                            builder,
+                            parallelism,
+                            getPartitionKeys(),
+                            conf);
         }
 
         return StreamingSink.sink(
@@ -500,5 +507,10 @@ public class HiveTableSink implements DynamicTableSink, SupportsPartitioning, Su
                 throw new UncheckedIOException(e);
             }
         }
+    }
+
+    @VisibleForTesting
+    public JobConf getJobConf() {
+        return jobConf;
     }
 }

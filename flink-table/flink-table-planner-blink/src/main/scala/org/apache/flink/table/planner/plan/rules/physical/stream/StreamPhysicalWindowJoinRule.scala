@@ -23,13 +23,11 @@ import org.apache.flink.table.planner.plan.nodes.FlinkConventions
 import org.apache.flink.table.planner.plan.nodes.logical.{FlinkLogicalJoin, FlinkLogicalRel}
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowJoin
 import org.apache.flink.table.planner.plan.`trait`.FlinkRelDistribution
-import org.apache.flink.table.planner.plan.utils.WindowJoinUtil.{containsWindowStartEqualityAndEndEquality, excludeWindowStartEqualityAndEndEqualityFromJoinCondition, getChildWindowProperties}
+import org.apache.flink.table.planner.plan.utils.WindowJoinUtil.{satisfyWindowJoin, excludeWindowStartEqualityAndEndEqualityFromWindowJoinCondition, getChildWindowProperties}
 
 import org.apache.calcite.plan.RelOptRule.{any, operand}
 import org.apache.calcite.plan.{RelOptRule, RelOptRuleCall, RelTraitSet}
 import org.apache.calcite.rel.RelNode
-
-import java.util
 
 /**
  * Rule to convert a [[FlinkLogicalJoin]] into a [[StreamPhysicalWindowJoin]].
@@ -43,25 +41,25 @@ class StreamPhysicalWindowJoinRule
 
   override def matches(call: RelOptRuleCall): Boolean = {
     val join = call.rel[FlinkLogicalJoin](0)
-    containsWindowStartEqualityAndEndEquality(join)
+    satisfyWindowJoin(join)
   }
 
   override def onMatch(call: RelOptRuleCall): Unit = {
 
     def toHashTraitByColumns(
-        columns: util.Collection[_ <: Number],
+        columns: Array[Int],
         inputTraitSet: RelTraitSet): RelTraitSet = {
-      val distribution = if (columns.size() == 0) {
+      val distribution = if (columns.isEmpty) {
         FlinkRelDistribution.SINGLETON
       } else {
-        FlinkRelDistribution.hash(columns)
+        FlinkRelDistribution.hash(columns, true)
       }
       inputTraitSet
         .replace(FlinkConventions.STREAM_PHYSICAL)
         .replace(distribution)
     }
 
-    def convertInput(input: RelNode, columns: util.Collection[_ <: Number]): RelNode = {
+    def convertInput(input: RelNode, columns: Array[Int]): RelNode = {
       val requiredTraitSet = toHashTraitByColumns(columns, input.getTraitSet)
       RelOptRule.convert(input, requiredTraitSet)
     }
@@ -75,7 +73,7 @@ class StreamPhysicalWindowJoinRule
       windowEndEqualityRightKeys,
       remainLeftKeys,
       remainRightKeys,
-      remainCondition) = excludeWindowStartEqualityAndEndEqualityFromJoinCondition(join)
+      remainCondition) = excludeWindowStartEqualityAndEndEqualityFromWindowJoinCondition(join)
     val providedTraitSet: RelTraitSet = join.getTraitSet.replace(FlinkConventions.STREAM_PHYSICAL)
 
     val left = call.rel[FlinkLogicalRel](1)
@@ -89,13 +87,13 @@ class StreamPhysicalWindowJoinRule
     val leftWindowing = new WindowAttachedWindowingStrategy(
       leftWindowProperties.getWindowSpec,
       leftWindowProperties.getTimeAttributeType,
-      windowStartEqualityLeftKeys.getInt(0),
-      windowEndEqualityLeftKeys.getInt(0))
+      windowStartEqualityLeftKeys(0),
+      windowEndEqualityLeftKeys(0))
     val rightWindowing = new WindowAttachedWindowingStrategy(
       rightWindowProperties.getWindowSpec,
       rightWindowProperties.getTimeAttributeType,
-      windowStartEqualityRightKeys.getInt(0),
-      windowEndEqualityRightKeys.getInt(0))
+      windowStartEqualityRightKeys(0),
+      windowEndEqualityRightKeys(0))
 
     val newWindowJoin = new StreamPhysicalWindowJoin(
       join.getCluster,

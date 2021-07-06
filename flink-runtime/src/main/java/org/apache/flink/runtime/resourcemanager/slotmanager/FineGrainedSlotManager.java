@@ -26,20 +26,21 @@ import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.clusterframework.types.SlotID;
-import org.apache.flink.runtime.concurrent.FutureUtils;
-import org.apache.flink.runtime.concurrent.ScheduledExecutor;
 import org.apache.flink.runtime.instance.InstanceID;
 import org.apache.flink.runtime.metrics.MetricNames;
 import org.apache.flink.runtime.metrics.groups.SlotManagerMetricGroup;
 import org.apache.flink.runtime.resourcemanager.ResourceManagerId;
 import org.apache.flink.runtime.resourcemanager.WorkerResourceSpec;
 import org.apache.flink.runtime.resourcemanager.registration.TaskExecutorConnection;
+import org.apache.flink.runtime.rest.messages.taskmanager.SlotInfo;
 import org.apache.flink.runtime.slots.ResourceRequirement;
 import org.apache.flink.runtime.slots.ResourceRequirements;
 import org.apache.flink.runtime.taskexecutor.SlotReport;
 import org.apache.flink.runtime.util.ResourceCounter;
 import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.concurrent.FutureUtils;
+import org.apache.flink.util.concurrent.ScheduledExecutor;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -217,6 +218,8 @@ public class FineGrainedSlotManager implements SlotManager {
 
         LOG.info("Suspending the slot manager.");
 
+        slotManagerMetricGroup.close();
+
         // stop the timeout checks for the TaskManagers
         if (taskManagerTimeoutsCheck != null) {
             taskManagerTimeoutsCheck.cancel(false);
@@ -248,7 +251,6 @@ public class FineGrainedSlotManager implements SlotManager {
         LOG.info("Closing the slot manager.");
 
         suspend();
-        slotManagerMetricGroup.close();
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -256,12 +258,22 @@ public class FineGrainedSlotManager implements SlotManager {
     // ---------------------------------------------------------------------------------------------
 
     @Override
+    public void clearResourceRequirements(JobID jobId) {
+        jobMasterTargetAddresses.remove(jobId);
+        resourceTracker.notifyResourceRequirements(jobId, Collections.emptyList());
+    }
+
+    @Override
     public void processResourceRequirements(ResourceRequirements resourceRequirements) {
         checkInit();
-        LOG.debug(
-                "Received resource requirements from job {}: {}",
-                resourceRequirements.getJobId(),
-                resourceRequirements.getResourceRequirements());
+        if (resourceRequirements.getResourceRequirements().isEmpty()) {
+            LOG.info("Clearing resource requirements of job {}", resourceRequirements.getJobId());
+        } else {
+            LOG.info(
+                    "Received resource requirements from job {}: {}",
+                    resourceRequirements.getJobId(),
+                    resourceRequirements.getResourceRequirements());
+        }
 
         if (resourceRequirements.getResourceRequirements().isEmpty()) {
             jobMasterTargetAddresses.remove(resourceRequirements.getJobId());
@@ -292,7 +304,7 @@ public class FineGrainedSlotManager implements SlotManager {
             ResourceProfile totalResourceProfile,
             ResourceProfile defaultSlotResourceProfile) {
         checkInit();
-        LOG.debug(
+        LOG.info(
                 "Registering task executor {} under {} at the slot manager.",
                 taskExecutorConnection.getResourceID(),
                 taskExecutorConnection.getInstanceID());
@@ -389,7 +401,7 @@ public class FineGrainedSlotManager implements SlotManager {
     public boolean unregisterTaskManager(InstanceID instanceId, Exception cause) {
         checkInit();
 
-        LOG.debug("Unregistering task executor {} from the slot manager.", instanceId);
+        LOG.info("Unregistering task executor {} from the slot manager.", instanceId);
 
         if (taskManagerTracker.getRegisteredTaskManager(instanceId).isPresent()) {
             Set<AllocationID> allocatedSlots =
@@ -633,7 +645,16 @@ public class FineGrainedSlotManager implements SlotManager {
 
     @Override
     public ResourceProfile getFreeResourceOf(InstanceID instanceID) {
-        return taskManagerTracker.getRegisteredResourceOf(instanceID);
+        return taskManagerTracker.getFreeResourceOf(instanceID);
+    }
+
+    @Override
+    public Collection<SlotInfo> getAllocatedSlotsOf(InstanceID instanceID) {
+        return taskManagerTracker.getRegisteredTaskManager(instanceID)
+                .map(TaskManagerInfo::getAllocatedSlots).map(Map::values)
+                .orElse(Collections.emptyList()).stream()
+                .map(slot -> new SlotInfo(slot.getJobId(), slot.getResourceProfile()))
+                .collect(Collectors.toList());
     }
 
     @Override
@@ -685,7 +706,7 @@ public class FineGrainedSlotManager implements SlotManager {
 
     private void releaseIdleTaskExecutor(InstanceID timedOutTaskManagerId) {
         final FlinkException cause = new FlinkException("TaskManager exceeded the idle timeout.");
-        LOG.debug(
+        LOG.info(
                 "Release TaskManager {} because it exceeded the idle timeout.",
                 timedOutTaskManagerId);
         resourceActions.releaseResource(timedOutTaskManagerId, cause);

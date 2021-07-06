@@ -25,7 +25,7 @@ import org.apache.flink.table.planner.plan.nodes.logical.{FlinkLogicalAggregate,
 import org.apache.flink.table.planner.plan.nodes.physical.common.CommonPhysicalLookupJoin
 import org.apache.flink.table.planner.plan.nodes.physical.stream.{StreamPhysicalCorrelateBase, StreamPhysicalMiniBatchAssigner, StreamPhysicalTemporalJoin, StreamPhysicalWindowAggregate, StreamPhysicalWindowJoin, StreamPhysicalWindowRank, StreamPhysicalWindowTableFunction}
 import org.apache.flink.table.planner.plan.schema.FlinkPreparingTableBase
-import org.apache.flink.table.planner.plan.utils.WindowJoinUtil.containsWindowStartEqualityAndEndEquality
+import org.apache.flink.table.planner.plan.utils.WindowJoinUtil.satisfyWindowJoin
 import org.apache.flink.table.planner.plan.utils.WindowUtil.{convertToWindowingStrategy, groupingContainsWindowStartEnd, isWindowTableFunctionCall}
 import org.apache.flink.table.planner.{JArrayList, JHashMap, JList}
 
@@ -214,13 +214,16 @@ class FlinkRelMdWindowProperties private extends MetadataHandler[FlinkMetadata.W
     }
 
     val startColumns = windowProperties.getWindowStartColumns.intersect(grouping)
+      .map(grouping.indexOf(_)).toList
     val endColumns = windowProperties.getWindowEndColumns.intersect(grouping)
+      .map(grouping.indexOf(_)).toList
     val timeColumns = windowProperties.getWindowTimeColumns.intersect(grouping)
+      .map(grouping.indexOf(_)).toList
 
     RelWindowProperties.create(
-      startColumns,
-      endColumns,
-      timeColumns,
+      ImmutableBitSet.of(startColumns :_*),
+      ImmutableBitSet.of(endColumns :_*),
+      ImmutableBitSet.of(timeColumns :_*),
       windowProperties.getWindowSpec,
       windowProperties.getTimeAttributeType
     )
@@ -331,7 +334,7 @@ class FlinkRelMdWindowProperties private extends MetadataHandler[FlinkMetadata.W
   def getWindowProperties(
       rel: FlinkLogicalJoin,
       mq: RelMetadataQuery): RelWindowProperties = {
-    if (containsWindowStartEqualityAndEndEquality(rel)) {
+    if (satisfyWindowJoin(rel)) {
       getJoinWindowProperties(rel.getLeft, rel.getRight, mq)
     } else {
       null

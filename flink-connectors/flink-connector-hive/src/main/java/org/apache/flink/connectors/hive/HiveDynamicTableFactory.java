@@ -20,9 +20,9 @@ package org.apache.flink.connectors.hive;
 
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.table.api.ValidationException;
-import org.apache.flink.table.catalog.CatalogPropertiesUtil;
+import org.apache.flink.connectors.hive.util.JobConfUtils;
 import org.apache.flink.table.catalog.CatalogTable;
+import org.apache.flink.table.catalog.hive.HiveCatalog;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.factories.DynamicTableSinkFactory;
@@ -34,11 +34,8 @@ import org.apache.flink.util.Preconditions;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.mapred.JobConf;
 
-import java.util.HashMap;
-import java.util.Map;
 import java.util.Set;
 
-import static org.apache.flink.table.catalog.CatalogPropertiesUtil.IS_GENERIC;
 import static org.apache.flink.table.filesystem.FileSystemOptions.STREAMING_SOURCE_ENABLE;
 import static org.apache.flink.table.filesystem.FileSystemOptions.STREAMING_SOURCE_PARTITION_INCLUDE;
 
@@ -66,33 +63,19 @@ public class HiveDynamicTableFactory implements DynamicTableSourceFactory, Dynam
         throw new UnsupportedOperationException("Hive factory is only work for catalog.");
     }
 
-    private static CatalogTable removeIsGenericFlag(Context context) {
-        Map<String, String> newOptions = new HashMap<>(context.getCatalogTable().getOptions());
-        boolean isGeneric = Boolean.parseBoolean(newOptions.remove(IS_GENERIC));
-        // temporary table doesn't have the IS_GENERIC flag but we still consider it generic
-        if (!isGeneric && !context.isTemporary()) {
-            throw new ValidationException(
-                    "Hive dynamic table factory now only work for generic table.");
-        }
-        return context.getCatalogTable().copy(newOptions);
-    }
-
     @Override
     public DynamicTableSink createDynamicTableSink(Context context) {
-        boolean isGeneric =
-                Boolean.parseBoolean(
-                        context.getCatalogTable()
-                                .getOptions()
-                                .get(CatalogPropertiesUtil.IS_GENERIC));
+        boolean isHiveTable = HiveCatalog.isHiveTable(context.getCatalogTable().getOptions());
 
-        // temporary table doesn't have the IS_GENERIC flag but we still consider it generic
-        if (!isGeneric && !context.isTemporary()) {
+        // we don't support temporary hive tables yet
+        if (isHiveTable && !context.isTemporary()) {
             Integer configuredParallelism =
                     Configuration.fromMap(context.getCatalogTable().getOptions())
                             .get(FileSystemOptions.SINK_PARALLELISM);
+            JobConf jobConf = JobConfUtils.createJobConfWithCredentials(hiveConf);
             return new HiveTableSink(
                     context.getConfiguration(),
-                    new JobConf(hiveConf),
+                    jobConf,
                     context.getObjectIdentifier(),
                     context.getCatalogTable(),
                     configuredParallelism);
@@ -100,7 +83,7 @@ public class HiveDynamicTableFactory implements DynamicTableSourceFactory, Dynam
             return FactoryUtil.createTableSink(
                     null, // we already in the factory of catalog
                     context.getObjectIdentifier(),
-                    removeIsGenericFlag(context),
+                    context.getCatalogTable(),
                     context.getConfiguration(),
                     context.getClassLoader(),
                     context.isTemporary());
@@ -109,14 +92,10 @@ public class HiveDynamicTableFactory implements DynamicTableSourceFactory, Dynam
 
     @Override
     public DynamicTableSource createDynamicTableSource(Context context) {
-        boolean isGeneric =
-                Boolean.parseBoolean(
-                        context.getCatalogTable()
-                                .getOptions()
-                                .get(CatalogPropertiesUtil.IS_GENERIC));
+        boolean isHiveTable = HiveCatalog.isHiveTable(context.getCatalogTable().getOptions());
 
-        // temporary table doesn't have the IS_GENERIC flag but we still consider it generic
-        if (!isGeneric && !context.isTemporary()) {
+        // we don't support temporary hive tables yet
+        if (isHiveTable && !context.isTemporary()) {
             CatalogTable catalogTable = Preconditions.checkNotNull(context.getCatalogTable());
 
             boolean isStreamingSource =
@@ -137,17 +116,18 @@ public class HiveDynamicTableFactory implements DynamicTableSourceFactory, Dynam
                                                     STREAMING_SOURCE_PARTITION_INCLUDE.key(),
                                                     STREAMING_SOURCE_PARTITION_INCLUDE
                                                             .defaultValue()));
+            JobConf jobConf = JobConfUtils.createJobConfWithCredentials(hiveConf);
             // hive table source that has not lookup ability
             if (isStreamingSource && includeAllPartition) {
                 return new HiveTableSource(
-                        new JobConf(hiveConf),
+                        jobConf,
                         context.getConfiguration(),
                         context.getObjectIdentifier().toObjectPath(),
                         catalogTable);
             } else {
                 // hive table source that has scan and lookup ability
                 return new HiveLookupTableSource(
-                        new JobConf(hiveConf),
+                        jobConf,
                         context.getConfiguration(),
                         context.getObjectIdentifier().toObjectPath(),
                         catalogTable);
@@ -157,7 +137,7 @@ public class HiveDynamicTableFactory implements DynamicTableSourceFactory, Dynam
             return FactoryUtil.createTableSource(
                     null, // we already in the factory of catalog
                     context.getObjectIdentifier(),
-                    removeIsGenericFlag(context),
+                    context.getCatalogTable(),
                     context.getConfiguration(),
                     context.getClassLoader(),
                     context.isTemporary());

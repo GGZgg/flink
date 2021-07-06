@@ -22,12 +22,14 @@ import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.IllegalConfigurationException;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.configuration.StateBackendOptions;
 import org.apache.flink.runtime.state.delegate.DelegatingStateBackend;
 import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
 import org.apache.flink.runtime.state.hashmap.HashMapStateBackendFactory;
 import org.apache.flink.runtime.state.memory.MemoryStateBackend;
 import org.apache.flink.runtime.state.memory.MemoryStateBackendFactory;
 import org.apache.flink.util.DynamicCodeLoadingException;
+import org.apache.flink.util.TernaryBoolean;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,7 +41,6 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.util.Optional;
 
-import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /** This class contains utility methods to load state backends from configurations. */
@@ -79,7 +80,7 @@ public class StateBackendLoader {
 
     /**
      * Loads the unwrapped state backend from the configuration, from the parameter 'state.backend',
-     * as defined in {@link CheckpointingOptions#STATE_BACKEND}.
+     * as defined in {@link StateBackendOptions#STATE_BACKEND}.
      *
      * <p>The state backends can be specified either via their shortcut name, or via the class name
      * of a {@link StateBackendFactory}. If a StateBackendFactory class name is specified, the
@@ -102,14 +103,14 @@ public class StateBackendLoader {
      * @throws IOException May be thrown by the StateBackendFactory when instantiating the state
      *     backend
      */
-    private static StateBackend loadUnwrappedStateBackendFromConfig(
+    public static StateBackend loadStateBackendFromConfig(
             ReadableConfig config, ClassLoader classLoader, @Nullable Logger logger)
             throws IllegalConfigurationException, DynamicCodeLoadingException, IOException {
 
         checkNotNull(config, "config");
         checkNotNull(classLoader, "classLoader");
 
-        final String backendName = config.get(CheckpointingOptions.STATE_BACKEND);
+        final String backendName = config.get(StateBackendOptions.STATE_BACKEND);
         if (backendName == null) {
             return null;
         }
@@ -175,7 +176,7 @@ public class StateBackendLoader {
                 } catch (ClassCastException | InstantiationException | IllegalAccessException e) {
                     throw new DynamicCodeLoadingException(
                             "The class configured under '"
-                                    + CheckpointingOptions.STATE_BACKEND.key()
+                                    + StateBackendOptions.STATE_BACKEND.key()
                                     + "' is not a valid state backend factory ("
                                     + backendName
                                     + ')',
@@ -183,49 +184,6 @@ public class StateBackendLoader {
                 }
 
                 return factory.createFromConfig(config, classLoader);
-        }
-    }
-
-    /**
-     * Loads the state backend from the configuration. It returns a {@code ChangelogStateBackend} if
-     * '{@code CheckpointingOptions.ENABLE_STATE_CHANGE_LOG}' is enabled; otherwise returns an
-     * unwrapped state backend created through {@link
-     * StateBackendLoader#loadUnwrappedStateBackendFromConfig}.
-     *
-     * <p>Refer to {@link StateBackendLoader#loadUnwrappedStateBackendFromConfig} for details on how
-     * an unwrapped state backend is loaded from the configuration.
-     *
-     * @param config The configuration to load the state backend from
-     * @param classLoader The class loader that should be used to load the state backend
-     * @param logger Optionally, a logger to log actions to (may be null)
-     * @return The instantiated {@code ChangelogStateBackend} if '{@code
-     *     CheckpointingOptions.ENABLE_STATE_CHANGE_LOG}' is enabled; An unwrapped state backend
-     *     otherwise
-     * @throws DynamicCodeLoadingException Thrown if a state backend factory is configured and the
-     *     factory class was not found or the factory could not be instantiated
-     * @throws IllegalConfigurationException May be thrown by the StateBackendFactory when creating
-     *     / configuring the state backend in the factory
-     * @throws IOException May be thrown by the StateBackendFactory when instantiating the state
-     *     backend
-     */
-    public static StateBackend loadStateBackendFromConfig(
-            ReadableConfig config, ClassLoader classLoader, @Nullable Logger logger)
-            throws IllegalConfigurationException, DynamicCodeLoadingException, IOException {
-
-        checkNotNull(config, "config");
-        checkNotNull(classLoader, "classLoader");
-
-        final StateBackend backend =
-                loadUnwrappedStateBackendFromConfig(config, classLoader, logger);
-
-        checkArgument(
-                !(backend instanceof DelegatingStateBackend),
-                "expecting non-delegating state backend");
-
-        if (config.get(CheckpointingOptions.ENABLE_STATE_CHANGE_LOG) && (backend != null)) {
-            return loadChangelogStateBackend(backend, classLoader);
-        } else {
-            return backend;
         }
     }
 
@@ -239,8 +197,8 @@ public class StateBackendLoader {
      * ConfigurableStateBackend}, this methods calls {@link
      * ConfigurableStateBackend#configure(ReadableConfig, ClassLoader)} on the state backend.
      *
-     * <p>Refer to {@link #loadUnwrappedStateBackendFromConfig(ReadableConfig, ClassLoader, Logger)}
-     * for details on how the state backend is loaded from the configuration.
+     * <p>Refer to {@link #loadStateBackendFromConfig(ReadableConfig, ClassLoader, Logger)} for
+     * details on how the state backend is loaded from the configuration.
      *
      * @param config The configuration to load the state backend from
      * @param classLoader The class loader that should be used to load the state backend
@@ -288,8 +246,7 @@ public class StateBackendLoader {
             }
         } else {
             // (2) check if the config defines a state backend
-            final StateBackend fromConfig =
-                    loadUnwrappedStateBackendFromConfig(config, classLoader, logger);
+            final StateBackend fromConfig = loadStateBackendFromConfig(config, classLoader, logger);
             if (fromConfig != null) {
                 backend = fromConfig;
             } else {
@@ -313,6 +270,8 @@ public class StateBackendLoader {
      * If delegation is not enabled, the underlying wrapped state backend is returned instead.
      *
      * @param fromApplication StateBackend defined from application
+     * @param isChangelogStateBackendEnableFromApplication whether to enable the
+     *     ChangelogStateBackend from application
      * @param config The configuration to load the state backend from
      * @param classLoader The class loader that should be used to load the state backend
      * @param logger Optionally, a logger to log actions to (may be null)
@@ -326,21 +285,37 @@ public class StateBackendLoader {
      */
     public static StateBackend fromApplicationOrConfigOrDefault(
             @Nullable StateBackend fromApplication,
+            TernaryBoolean isChangelogStateBackendEnableFromApplication,
             Configuration config,
             ClassLoader classLoader,
             @Nullable Logger logger)
             throws IllegalConfigurationException, DynamicCodeLoadingException, IOException {
 
-        final StateBackend backend =
+        StateBackend rootBackend =
                 loadFromApplicationOrConfigOrDefaultInternal(
                         fromApplication, config, classLoader, logger);
 
-        if (config.get(CheckpointingOptions.ENABLE_STATE_CHANGE_LOG)
-                && !(fromApplication instanceof DelegatingStateBackend)) {
-            return loadChangelogStateBackend(backend, classLoader);
+        // Configuration from application will override the one from env.
+        boolean enableChangeLog =
+                TernaryBoolean.TRUE.equals(isChangelogStateBackendEnableFromApplication)
+                        || (TernaryBoolean.UNDEFINED.equals(
+                                        isChangelogStateBackendEnableFromApplication)
+                                && config.get(CheckpointingOptions.ENABLE_STATE_CHANGE_LOG));
+
+        StateBackend backend;
+        if (enableChangeLog) {
+            backend = loadChangelogStateBackend(rootBackend, classLoader);
+            LOG.info(
+                    "State backend loader loads {} to delegate {}",
+                    backend.getClass().getSimpleName(),
+                    rootBackend.getClass().getSimpleName());
         } else {
-            return backend;
+            backend = rootBackend;
+            LOG.info(
+                    "State backend loader loads the state backend as {}",
+                    backend.getClass().getSimpleName());
         }
+        return backend;
     }
 
     /**
@@ -367,8 +342,7 @@ public class StateBackendLoader {
 
         // (2) check if the config defines a state backend
         try {
-            final StateBackend fromConfig =
-                    loadUnwrappedStateBackendFromConfig(config, classLoader, LOG);
+            final StateBackend fromConfig = loadStateBackendFromConfig(config, classLoader, LOG);
             if (fromConfig != null) {
                 return fromConfig.useManagedMemory();
             }
@@ -386,16 +360,13 @@ public class StateBackendLoader {
     private static StateBackend loadChangelogStateBackend(
             StateBackend backend, ClassLoader classLoader) throws DynamicCodeLoadingException {
 
-        LOG.info(
-                "Delegate State Backend is used, and the root State Backend is {}",
-                backend.getClass().getSimpleName());
-
         // ChangelogStateBackend resides in a separate module, load it using reflection
         try {
             Constructor<? extends DelegatingStateBackend> constructor =
                     Class.forName(CHANGELOG_STATE_BACKEND, false, classLoader)
                             .asSubclass(DelegatingStateBackend.class)
-                            .getConstructor(StateBackend.class);
+                            .getDeclaredConstructor(StateBackend.class);
+            constructor.setAccessible(true);
             return constructor.newInstance(backend);
         } catch (ClassNotFoundException e) {
             throw new DynamicCodeLoadingException(

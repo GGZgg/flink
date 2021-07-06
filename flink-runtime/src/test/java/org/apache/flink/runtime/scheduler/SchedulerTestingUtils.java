@@ -32,8 +32,6 @@ import org.apache.flink.runtime.checkpoint.CompletedCheckpoint;
 import org.apache.flink.runtime.checkpoint.PendingCheckpoint;
 import org.apache.flink.runtime.checkpoint.StandaloneCheckpointRecoveryFactory;
 import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
-import org.apache.flink.runtime.concurrent.ScheduledExecutor;
-import org.apache.flink.runtime.concurrent.ScheduledExecutorServiceAdapter;
 import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
@@ -68,8 +66,11 @@ import org.apache.flink.runtime.state.CheckpointStorage;
 import org.apache.flink.runtime.state.StateBackend;
 import org.apache.flink.runtime.taskexecutor.TaskExecutorOperatorEventGateway;
 import org.apache.flink.runtime.taskmanager.TaskExecutionState;
-import org.apache.flink.runtime.testingUtils.TestingUtils;
+import org.apache.flink.runtime.testutils.TestingUtils;
 import org.apache.flink.util.SerializedValue;
+import org.apache.flink.util.TernaryBoolean;
+import org.apache.flink.util.concurrent.ScheduledExecutor;
+import org.apache.flink.util.concurrent.ScheduledExecutorServiceAdapter;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -162,6 +163,7 @@ public class SchedulerTestingUtils {
                         false,
                         false,
                         false,
+                        0,
                         0);
 
         SerializedValue<StateBackend> serializedStateBackend = null;
@@ -184,7 +186,11 @@ public class SchedulerTestingUtils {
 
         jobGraph.setSnapshotSettings(
                 new JobCheckpointingSettings(
-                        config, serializedStateBackend, serializedCheckpointStorage, null));
+                        config,
+                        serializedStateBackend,
+                        TernaryBoolean.UNDEFINED,
+                        serializedCheckpointStorage,
+                        null));
     }
 
     public static Collection<ExecutionAttemptID> getAllCurrentExecutionAttempts(
@@ -221,19 +227,24 @@ public class SchedulerTestingUtils {
                         attemptID, ExecutionState.CANCELED, new Exception("test task failure")));
     }
 
-    public static void setExecutionToRunning(
-            DefaultScheduler scheduler, JobVertexID jvid, int subtask) {
+    public static void setExecutionToState(
+            ExecutionState executionState,
+            DefaultScheduler scheduler,
+            JobVertexID jvid,
+            int subtask) {
         final ExecutionAttemptID attemptID = getAttemptId(scheduler, jvid, subtask);
-        scheduler.updateTaskExecutionState(
-                new TaskExecutionState(attemptID, ExecutionState.RUNNING));
+        scheduler.updateTaskExecutionState(new TaskExecutionState(attemptID, executionState));
     }
 
     public static void setAllExecutionsToRunning(final DefaultScheduler scheduler) {
         getAllCurrentExecutionAttempts(scheduler)
                 .forEach(
-                        (attemptId) ->
-                                scheduler.updateTaskExecutionState(
-                                        new TaskExecutionState(attemptId, ExecutionState.RUNNING)));
+                        (attemptId) -> {
+                            scheduler.updateTaskExecutionState(
+                                    new TaskExecutionState(attemptId, ExecutionState.INITIALIZING));
+                            scheduler.updateTaskExecutionState(
+                                    new TaskExecutionState(attemptId, ExecutionState.RUNNING));
+                        });
     }
 
     public static void setAllExecutionsToCancelled(final DefaultScheduler scheduler) {

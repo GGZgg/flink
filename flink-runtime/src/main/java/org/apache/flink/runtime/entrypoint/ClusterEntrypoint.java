@@ -35,10 +35,9 @@ import org.apache.flink.configuration.WebOptions;
 import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.plugin.PluginManager;
 import org.apache.flink.core.plugin.PluginUtils;
+import org.apache.flink.core.security.FlinkSecurityManager;
 import org.apache.flink.runtime.blob.BlobServer;
 import org.apache.flink.runtime.clusterframework.ApplicationStatus;
-import org.apache.flink.runtime.concurrent.FutureUtils;
-import org.apache.flink.runtime.concurrent.ScheduledExecutor;
 import org.apache.flink.runtime.dispatcher.ExecutionGraphInfoStore;
 import org.apache.flink.runtime.dispatcher.MiniDispatcher;
 import org.apache.flink.runtime.entrypoint.component.DispatcherResourceManagerComponent;
@@ -54,15 +53,15 @@ import org.apache.flink.runtime.metrics.ReporterSetup;
 import org.apache.flink.runtime.metrics.groups.ProcessMetricGroup;
 import org.apache.flink.runtime.metrics.util.MetricUtils;
 import org.apache.flink.runtime.resourcemanager.ResourceManager;
+import org.apache.flink.runtime.rpc.AddressResolution;
 import org.apache.flink.runtime.rpc.FatalErrorHandler;
 import org.apache.flink.runtime.rpc.RpcService;
+import org.apache.flink.runtime.rpc.RpcSystem;
+import org.apache.flink.runtime.rpc.RpcSystemUtils;
 import org.apache.flink.runtime.rpc.RpcUtils;
-import org.apache.flink.runtime.rpc.akka.AkkaRpcServiceUtils;
-import org.apache.flink.runtime.security.FlinkSecurityManager;
 import org.apache.flink.runtime.security.SecurityConfiguration;
 import org.apache.flink.runtime.security.SecurityUtils;
 import org.apache.flink.runtime.security.contexts.SecurityContext;
-import org.apache.flink.runtime.util.ExecutorThreadFactory;
 import org.apache.flink.runtime.util.ZooKeeperUtils;
 import org.apache.flink.runtime.webmonitor.retriever.impl.RpcMetricQueryServiceRetriever;
 import org.apache.flink.util.AutoCloseableAsync;
@@ -71,6 +70,9 @@ import org.apache.flink.util.ExecutorUtils;
 import org.apache.flink.util.FileUtils;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.ShutdownHookUtil;
+import org.apache.flink.util.concurrent.ExecutorThreadFactory;
+import org.apache.flink.util.concurrent.FutureUtils;
+import org.apache.flink.util.concurrent.ScheduledExecutor;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -165,7 +167,7 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
 
         shutDownHook =
                 ShutdownHookUtil.addShutdownHook(
-                        this::cleanupDirectories, getClass().getSimpleName(), LOG);
+                        () -> this.closeAsync().join(), getClass().getSimpleName(), LOG);
     }
 
     public CompletableFuture<ApplicationStatus> getTerminationFuture() {
@@ -198,6 +200,7 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
                 // clean up any partial state
                 shutDownAsync(
                                 ApplicationStatus.FAILED,
+                                ShutdownBehaviour.STOP_APPLICATION,
                                 ExceptionUtils.stringifyException(strippedThrowable),
                                 false)
                         .get(
@@ -266,13 +269,18 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
                                 if (throwable != null) {
                                     shutDownAsync(
                                             ApplicationStatus.UNKNOWN,
+                                            ShutdownBehaviour.STOP_APPLICATION,
                                             ExceptionUtils.stringifyException(throwable),
                                             false);
                                 } else {
                                     // This is the general shutdown path. If a separate more
                                     // specific shutdown was
                                     // already triggered, this will do nothing
-                                    shutDownAsync(applicationStatus, null, true);
+                                    shutDownAsync(
+                                            applicationStatus,
+                                            ShutdownBehaviour.STOP_APPLICATION,
+                                            null,
+                                            true);
                                 }
                             });
         }
@@ -284,8 +292,11 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
         LOG.info("Initializing cluster services.");
 
         synchronized (lock) {
+            final RpcSystem rpcSystem = RpcSystem.load();
+
             commonRpcService =
-                    AkkaRpcServiceUtils.createRemoteRpcService(
+                    RpcUtils.createRemoteRpcService(
+                            rpcSystem,
                             configuration,
                             configuration.getString(JobManagerOptions.ADDRESS),
                             getRPCPortRange(configuration),
@@ -302,15 +313,15 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
                     Executors.newFixedThreadPool(
                             ClusterEntrypointUtils.getPoolSize(configuration),
                             new ExecutorThreadFactory("cluster-io"));
-            haServices = createHaServices(configuration, ioExecutor);
+            haServices = createHaServices(configuration, ioExecutor, rpcSystem);
             blobServer = new BlobServer(configuration, haServices.createBlobStore());
             blobServer.start();
             heartbeatServices = createHeartbeatServices(configuration);
-            metricRegistry = createMetricRegistry(configuration, pluginManager);
+            metricRegistry = createMetricRegistry(configuration, pluginManager, rpcSystem);
 
             final RpcService metricQueryServiceRpcService =
                     MetricUtils.startRemoteMetricsRpcService(
-                            configuration, commonRpcService.getAddress());
+                            configuration, commonRpcService.getAddress(), rpcSystem);
             metricRegistry.startQueryService(metricQueryServiceRpcService, null);
 
             final String hostname = RpcUtils.getHostname(commonRpcService);
@@ -343,11 +354,10 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
     }
 
     protected HighAvailabilityServices createHaServices(
-            Configuration configuration, Executor executor) throws Exception {
+            Configuration configuration, Executor executor, RpcSystemUtils rpcSystemUtils)
+            throws Exception {
         return HighAvailabilityServicesUtils.createHighAvailabilityServices(
-                configuration,
-                executor,
-                HighAvailabilityServicesUtils.AddressResolution.NO_ADDRESS_RESOLUTION);
+                configuration, executor, AddressResolution.NO_ADDRESS_RESOLUTION, rpcSystemUtils);
     }
 
     protected HeartbeatServices createHeartbeatServices(Configuration configuration) {
@@ -355,18 +365,24 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
     }
 
     protected MetricRegistryImpl createMetricRegistry(
-            Configuration configuration, PluginManager pluginManager) {
+            Configuration configuration,
+            PluginManager pluginManager,
+            RpcSystemUtils rpcSystemUtils) {
         return new MetricRegistryImpl(
-                MetricRegistryConfiguration.fromConfiguration(configuration),
+                MetricRegistryConfiguration.fromConfiguration(
+                        configuration, rpcSystemUtils.getMaximumMessageSizeInBytes(configuration)),
                 ReporterSetup.fromConfiguration(configuration, pluginManager));
     }
 
     @Override
     public CompletableFuture<Void> closeAsync() {
+        ShutdownHookUtil.removeShutdownHook(shutDownHook, getClass().getSimpleName(), LOG);
+
         return shutDownAsync(
                         ApplicationStatus.UNKNOWN,
+                        ShutdownBehaviour.STOP_PROCESS,
                         "Cluster entrypoint has been closed externally.",
-                        true)
+                        false)
                 .thenAccept(ignored -> {});
     }
 
@@ -444,7 +460,7 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
         ClusterEntryPointExceptionUtils.tryEnrichClusterEntryPointError(exception);
         LOG.error("Fatal error occurred in the cluster entrypoint.", exception);
 
-        System.exit(RUNTIME_FAILURE_RETURN_CODE);
+        FlinkSecurityManager.forceProcessExit(RUNTIME_FAILURE_RETURN_CODE);
     }
 
     // --------------------------------------------------
@@ -465,6 +481,7 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
 
     private CompletableFuture<ApplicationStatus> shutDownAsync(
             ApplicationStatus applicationStatus,
+            ShutdownBehaviour shutdownBehaviour,
             @Nullable String diagnostics,
             boolean cleanupHaData) {
         if (isShutDown.compareAndSet(false, true)) {
@@ -475,7 +492,7 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
                     diagnostics);
 
             final CompletableFuture<Void> shutDownApplicationFuture =
-                    closeClusterComponent(applicationStatus, diagnostics);
+                    closeClusterComponent(applicationStatus, shutdownBehaviour, diagnostics);
 
             final CompletableFuture<Void> serviceShutdownFuture =
                     FutureUtils.composeAfterwards(
@@ -498,19 +515,27 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
     }
 
     /**
-     * Deregister the Flink application from the resource management system by signalling the {@link
-     * ResourceManager}.
+     * Close cluster components and deregister the Flink application from the resource management
+     * system by signalling the {@link ResourceManager}.
      *
      * @param applicationStatus to terminate the application with
+     * @param shutdownBehaviour shutdown behaviour
      * @param diagnostics additional information about the shut down, can be {@code null}
      * @return Future which is completed once the shut down
      */
     private CompletableFuture<Void> closeClusterComponent(
-            ApplicationStatus applicationStatus, @Nullable String diagnostics) {
+            ApplicationStatus applicationStatus,
+            ShutdownBehaviour shutdownBehaviour,
+            @Nullable String diagnostics) {
         synchronized (lock) {
             if (clusterComponent != null) {
-                return clusterComponent.deregisterApplicationAndClose(
-                        applicationStatus, diagnostics);
+                switch (shutdownBehaviour) {
+                    case STOP_APPLICATION:
+                        return clusterComponent.stopApplication(applicationStatus, diagnostics);
+                    case STOP_PROCESS:
+                    default:
+                        return clusterComponent.stopProcess();
+                }
             } else {
                 return CompletableFuture.completedFuture(null);
             }
@@ -523,8 +548,6 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
      * @throws IOException if the temporary directories could not be cleaned up
      */
     protected void cleanupDirectories() throws IOException {
-        ShutdownHookUtil.removeShutdownHook(shutDownHook, getClass().getSimpleName(), LOG);
-
         final String webTmpDir = configuration.getString(WebOptions.TMP_DIR);
 
         FileUtils.deleteDirectory(new File(webTmpDir));
@@ -614,5 +637,10 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
 
         /** Directly stops after the job has finished. */
         DETACHED
+    }
+
+    private enum ShutdownBehaviour {
+        STOP_APPLICATION,
+        STOP_PROCESS,
     }
 }

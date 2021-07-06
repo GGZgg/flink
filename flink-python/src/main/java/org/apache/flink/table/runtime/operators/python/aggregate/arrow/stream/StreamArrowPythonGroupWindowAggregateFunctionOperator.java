@@ -27,6 +27,7 @@ import org.apache.flink.api.common.state.StateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.fnexecution.v1.FlinkFnApi;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.runtime.state.internal.InternalListState;
 import org.apache.flink.streaming.api.operators.InternalTimer;
@@ -57,10 +58,15 @@ import org.apache.flink.table.runtime.typeutils.RowDataSerializer;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.types.RowKind;
 
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedList;
 import java.util.List;
+
+import static org.apache.flink.table.runtime.util.TimeWindowUtil.toEpochMills;
+import static org.apache.flink.table.runtime.util.TimeWindowUtil.toEpochMillsForTimer;
+import static org.apache.flink.table.runtime.util.TimeWindowUtil.toUtcTimestampMills;
 
 /** The Stream Arrow Python {@link AggregateFunction} Operator for Group Window Aggregation. */
 @Internal
@@ -94,6 +100,13 @@ public class StreamArrowPythonGroupWindowAggregateFunctionOperator<K, W extends 
      * </ul>
      */
     private final long allowedLateness;
+
+    /**
+     * The shift timezone of the window, if the proctime or rowtime type is TIMESTAMP_LTZ, the shift
+     * timezone is the timezone user configured in TableConfig, other cases the timezone is UTC
+     * which means never shift when assigning windows.
+     */
+    private final ZoneId shiftTimeZone;
 
     /** Interface for working with time and timers. */
     private transient InternalTimerService<W> internalTimerService;
@@ -139,12 +152,22 @@ public class StreamArrowPythonGroupWindowAggregateFunctionOperator<K, W extends 
             long allowedLateness,
             PlannerNamedWindowProperty[] namedProperties,
             int[] groupingSet,
-            int[] udafInputOffsets) {
-        super(config, pandasAggFunctions, inputType, outputType, groupingSet, udafInputOffsets);
+            int[] udafInputOffsets,
+            ZoneId shiftTimeZone) {
+        super(
+                config,
+                pandasAggFunctions,
+                inputType,
+                outputType,
+                groupingSet,
+                udafInputOffsets,
+                FlinkFnApi.CoderParam.DataType.ARROW,
+                FlinkFnApi.CoderParam.DataType.ARROW);
         this.inputTimeFieldIndex = inputTimeFieldIndex;
         this.windowAssigner = windowAssigner;
         this.trigger = trigger;
         this.allowedLateness = allowedLateness;
+        this.shiftTimeZone = shiftTimeZone;
         buildWindow(namedProperties);
     }
 
@@ -190,6 +213,8 @@ public class StreamArrowPythonGroupWindowAggregateFunctionOperator<K, W extends 
         } else {
             timestamp = internalTimerService.currentProcessingTime();
         }
+        timestamp = toUtcTimestampMills(timestamp, shiftTimeZone);
+
         // Given the timestamp and element, returns the set of windows into which it
         // should be placed.
         elementWindows = windowAssigner.assignWindows(input, timestamp);
@@ -295,7 +320,8 @@ public class StreamArrowPythonGroupWindowAggregateFunctionOperator<K, W extends 
      */
     private boolean isWindowLate(W window) {
         return windowAssigner.isEventTime()
-                && (cleanupTime(window) <= internalTimerService.currentWatermark());
+                && (toEpochMillsForTimer(cleanupTime(window), shiftTimeZone)
+                        <= internalTimerService.currentWatermark());
     }
 
     /**
@@ -369,7 +395,7 @@ public class StreamArrowPythonGroupWindowAggregateFunctionOperator<K, W extends 
      * @param window the window whose state to discard
      */
     private void registerCleanupTimer(W window) {
-        long cleanupTime = cleanupTime(window);
+        long cleanupTime = toEpochMillsForTimer(cleanupTime(window), shiftTimeZone);
         if (cleanupTime == Long.MAX_VALUE) {
             // don't set a GC timer for "end of time"
             return;
@@ -399,7 +425,7 @@ public class StreamArrowPythonGroupWindowAggregateFunctionOperator<K, W extends 
                     windowProperty.setField(
                             i,
                             TimestampData.fromEpochMillis(
-                                    ((TimeWindow) currentWindow).getEnd() - 1));
+                                    getShiftEpochMills(((TimeWindow) currentWindow).getEnd() - 1)));
                     break;
                 case PROC_TIME_ATTRIBUTE:
                     windowProperty.setField(i, TimestampData.fromEpochMillis(-1));
@@ -407,8 +433,12 @@ public class StreamArrowPythonGroupWindowAggregateFunctionOperator<K, W extends 
         }
     }
 
+    private long getShiftEpochMills(long utcTimestampMills) {
+        return toEpochMills(utcTimestampMills, shiftTimeZone);
+    }
+
     private void cleanWindowIfNeeded(W window, long currentTime) throws Exception {
-        if (currentTime == cleanupTime(window)) {
+        if (currentTime == toEpochMillsForTimer(cleanupTime(window), shiftTimeZone)) {
             windowAccumulateData.setCurrentNamespace(window);
             windowAccumulateData.clear();
             windowRetractData.setCurrentNamespace(window);
@@ -483,6 +513,11 @@ public class StreamArrowPythonGroupWindowAggregateFunctionOperator<K, W extends 
         }
 
         @Override
+        public ZoneId getShiftTimeZone() {
+            return shiftTimeZone;
+        }
+
+        @Override
         public <S extends State> S getPartitionedState(StateDescriptor<S, ?> stateDescriptor) {
             try {
                 return StreamArrowPythonGroupWindowAggregateFunctionOperator.this
@@ -514,6 +549,11 @@ public class StreamArrowPythonGroupWindowAggregateFunctionOperator<K, W extends 
         @Override
         public long currentWatermark() {
             throw new RuntimeException("The method currentWatermark should not be called.");
+        }
+
+        @Override
+        public ZoneId getShiftTimeZone() {
+            return shiftTimeZone;
         }
 
         @Override

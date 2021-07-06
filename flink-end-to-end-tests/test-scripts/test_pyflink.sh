@@ -87,6 +87,14 @@ rm -rf dist
 
 python setup.py sdist
 
+pushd apache-flink-libraries
+
+python setup.py sdist
+
+pip install dist/*
+
+popd
+
 pip install dist/*
 
 cd dev
@@ -145,26 +153,6 @@ PYFLINK_CLIENT_EXECUTABLE=${PYTHON_EXEC} "${FLINK_DIR}/bin/flink" run \
     -pyarch "${TEST_DATA_DIR}/venv.zip" \
     -pyexec "venv.zip/.conda/bin/python" \
     -c org.apache.flink.python.tests.BlinkBatchPythonUdfSqlJob \
-    "${FLINK_PYTHON_TEST_DIR}/target/PythonUdfSqlJobExample.jar"
-
-echo "Test flink stream python udf sql job:\n"
-PYFLINK_CLIENT_EXECUTABLE=${PYTHON_EXEC} "${FLINK_DIR}/bin/flink" run \
-    -p 2 \
-    -pyfs "${FLINK_PYTHON_TEST_DIR}/python/add_one.py" \
-    -pyreq "${REQUIREMENTS_PATH}" \
-    -pyarch "${TEST_DATA_DIR}/venv.zip" \
-    -pyexec "venv.zip/.conda/bin/python" \
-    -c org.apache.flink.python.tests.FlinkStreamPythonUdfSqlJob \
-    "${FLINK_PYTHON_TEST_DIR}/target/PythonUdfSqlJobExample.jar"
-
-echo "Test flink batch python udf sql job:\n"
-PYFLINK_CLIENT_EXECUTABLE=${PYTHON_EXEC} "${FLINK_DIR}/bin/flink" run \
-    -p 2 \
-    -pyfs "${FLINK_PYTHON_TEST_DIR}/python/add_one.py" \
-    -pyreq "${REQUIREMENTS_PATH}" \
-    -pyarch "${TEST_DATA_DIR}/venv.zip" \
-    -pyexec "venv.zip/.conda/bin/python" \
-    -c org.apache.flink.python.tests.FlinkBatchPythonUdfSqlJob \
     "${FLINK_PYTHON_TEST_DIR}/target/PythonUdfSqlJobExample.jar"
 
 echo "Test using python udf in sql client:\n"
@@ -247,11 +235,11 @@ function read_msg_from_kafka {
 
 function cat_jm_logs {
      local log_file_name=${3:-standalonesession}
-     cat $FLINK_DIR/log/*$log_file_name*.log
+     cat $FLINK_LOG_DIR/*$log_file_name*.log
 }
 
 function cat_tm_logs {
-	local logfile="${FLINK_DIR}/log/flink*taskexecutor*log"
+	local logfile="$FLINK_LOG_DIR/flink*taskexecutor*log"
 	cat ${logfile}
 }
 

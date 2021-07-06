@@ -23,6 +23,7 @@ import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
+import org.apache.flink.configuration.SchedulerExecutionMode;
 import org.apache.flink.metrics.Gauge;
 import org.apache.flink.queryablestate.KvStateID;
 import org.apache.flink.runtime.JobException;
@@ -32,13 +33,13 @@ import org.apache.flink.runtime.checkpoint.CheckpointFailureReason;
 import org.apache.flink.runtime.checkpoint.CheckpointIDCounter;
 import org.apache.flink.runtime.checkpoint.CheckpointMetrics;
 import org.apache.flink.runtime.checkpoint.CheckpointRecoveryFactory;
+import org.apache.flink.runtime.checkpoint.CheckpointScheduling;
 import org.apache.flink.runtime.checkpoint.CheckpointsCleaner;
 import org.apache.flink.runtime.checkpoint.CompletedCheckpointStore;
 import org.apache.flink.runtime.checkpoint.TaskStateSnapshot;
 import org.apache.flink.runtime.client.JobExecutionException;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
-import org.apache.flink.runtime.concurrent.FutureUtils;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptorFactory;
 import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.executiongraph.ArchivedExecutionGraph;
@@ -61,6 +62,7 @@ import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobmanager.PartitionProducerDisposedException;
+import org.apache.flink.runtime.jobmanager.scheduler.NoResourceAvailableException;
 import org.apache.flink.runtime.jobmaster.LogicalSlot;
 import org.apache.flink.runtime.jobmaster.SerializedInputSplit;
 import org.apache.flink.runtime.jobmaster.SlotInfo;
@@ -78,13 +80,19 @@ import org.apache.flink.runtime.operators.coordination.TaskNotRunningException;
 import org.apache.flink.runtime.query.KvStateLocation;
 import org.apache.flink.runtime.query.UnknownKvStateLocation;
 import org.apache.flink.runtime.rpc.FatalErrorHandler;
+import org.apache.flink.runtime.scheduler.DefaultOperatorCoordinatorHandler;
+import org.apache.flink.runtime.scheduler.DefaultVertexParallelismInfo;
+import org.apache.flink.runtime.scheduler.DefaultVertexParallelismStore;
 import org.apache.flink.runtime.scheduler.ExecutionGraphFactory;
 import org.apache.flink.runtime.scheduler.ExecutionGraphHandler;
 import org.apache.flink.runtime.scheduler.ExecutionGraphInfo;
 import org.apache.flink.runtime.scheduler.OperatorCoordinatorHandler;
+import org.apache.flink.runtime.scheduler.SchedulerBase;
 import org.apache.flink.runtime.scheduler.SchedulerNG;
 import org.apache.flink.runtime.scheduler.SchedulerUtils;
 import org.apache.flink.runtime.scheduler.UpdateSchedulerNgOnInternalFailuresListener;
+import org.apache.flink.runtime.scheduler.VertexParallelismInformation;
+import org.apache.flink.runtime.scheduler.VertexParallelismStore;
 import org.apache.flink.runtime.scheduler.adaptive.allocator.ReservedSlots;
 import org.apache.flink.runtime.scheduler.adaptive.allocator.SlotAllocator;
 import org.apache.flink.runtime.scheduler.adaptive.allocator.VertexParallelism;
@@ -95,6 +103,7 @@ import org.apache.flink.runtime.util.ResourceCounter;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.concurrent.FutureUtils;
 import org.apache.flink.util.function.FunctionWithException;
 import org.apache.flink.util.function.ThrowingConsumer;
 
@@ -114,6 +123,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 /**
  * A {@link SchedulerNG} implementation that uses the declarative resource management and
@@ -141,11 +151,13 @@ public class AdaptiveScheduler
                 Executing.Context,
                 Restarting.Context,
                 Failing.Context,
-                Finished.Context {
+                Finished.Context,
+                StopWithSavepoint.Context {
 
     private static final Logger LOG = LoggerFactory.getLogger(AdaptiveScheduler.class);
 
     private final JobGraphJobInformation jobInformation;
+    private final VertexParallelismStore initialParallelismStore;
 
     private final DeclarativeSlotPool declarativeSlotPool;
 
@@ -172,7 +184,9 @@ public class AdaptiveScheduler
 
     private final ScaleUpController scaleUpController;
 
-    private final Duration resourceTimeout;
+    private final Duration initialResourceAllocationTimeout;
+
+    private final Duration resourceStabilizationTimeout;
 
     private final ExecutionGraphFactory executionGraphFactory;
 
@@ -187,6 +201,8 @@ public class AdaptiveScheduler
 
     private BackgroundTask<ExecutionGraph> backgroundTask = BackgroundTask.finishedBackgroundTask();
 
+    private final SchedulerExecutionMode executionMode;
+
     public AdaptiveScheduler(
             JobGraph jobGraph,
             Configuration configuration,
@@ -195,6 +211,8 @@ public class AdaptiveScheduler
             Executor ioExecutor,
             ClassLoader userCodeClassLoader,
             CheckpointRecoveryFactory checkpointRecoveryFactory,
+            Duration initialResourceAllocationTimeout,
+            Duration resourceStabilizationTimeout,
             JobManagerJobMetricGroup jobManagerJobMetricGroup,
             RestartBackoffTimeStrategy restartBackoffTimeStrategy,
             long initializationTimestamp,
@@ -204,9 +222,15 @@ public class AdaptiveScheduler
             ExecutionGraphFactory executionGraphFactory)
             throws JobExecutionException {
 
-        ensureFullyPipelinedStreamingJob(jobGraph);
+        assertPreconditions(jobGraph);
 
-        this.jobInformation = new JobGraphJobInformation(jobGraph);
+        this.executionMode = configuration.get(JobManagerOptions.SCHEDULER_MODE);
+
+        VertexParallelismStore vertexParallelismStore =
+                computeVertexParallelismStore(jobGraph, executionMode);
+        this.initialParallelismStore = vertexParallelismStore;
+        this.jobInformation = new JobGraphJobInformation(jobGraph, vertexParallelismStore);
+
         this.declarativeSlotPool = declarativeSlotPool;
         this.initializationTimestamp = initializationTimestamp;
         this.ioExecutor = ioExecutor;
@@ -235,20 +259,25 @@ public class AdaptiveScheduler
 
         this.scaleUpController = new ReactiveScaleUpController(configuration);
 
-        this.resourceTimeout = configuration.get(JobManagerOptions.RESOURCE_WAIT_TIMEOUT);
+        this.initialResourceAllocationTimeout = initialResourceAllocationTimeout;
+
+        this.resourceStabilizationTimeout = resourceStabilizationTimeout;
 
         this.executionGraphFactory = executionGraphFactory;
 
         registerMetrics();
     }
 
-    private static void ensureFullyPipelinedStreamingJob(JobGraph jobGraph)
-            throws RuntimeException {
+    private static void assertPreconditions(JobGraph jobGraph) throws RuntimeException {
         Preconditions.checkState(
                 jobGraph.getJobType() == JobType.STREAMING,
                 "The adaptive scheduler only supports streaming jobs.");
 
         for (JobVertex vertex : jobGraph.getVertices()) {
+            Preconditions.checkState(
+                    vertex.getParallelism() > 0,
+                    "The adaptive scheduler expects the parallelism being set for each JobVertex (violated JobVertex: %s).",
+                    vertex.getID());
             for (JobEdge jobEdge : vertex.getInputs()) {
                 Preconditions.checkState(
                         jobEdge.getSource().getResultType().isPipelined(),
@@ -257,6 +286,103 @@ public class AdaptiveScheduler
                         jobEdge.getTarget().getID());
             }
         }
+    }
+
+    /**
+     * Creates the parallelism store for a set of vertices, optionally with a flag to leave the
+     * vertex parallelism unchanged. If the flag is set, the parallelisms must be valid for
+     * execution.
+     *
+     * <p>We need to set parallelism to the max possible value when requesting resources, but when
+     * executing the graph we should respect what we are actually given.
+     *
+     * @param vertices The vertices to store parallelism information for
+     * @param adjustParallelism Whether to adjust the parallelism
+     * @param defaultMaxParallelismFunc a function for computing a default max parallelism if none
+     *     is specified on a given vertex
+     * @return The parallelism store.
+     */
+    @VisibleForTesting
+    static VertexParallelismStore computeReactiveModeVertexParallelismStore(
+            Iterable<JobVertex> vertices,
+            Function<JobVertex, Integer> defaultMaxParallelismFunc,
+            boolean adjustParallelism) {
+        DefaultVertexParallelismStore store = new DefaultVertexParallelismStore();
+
+        for (JobVertex vertex : vertices) {
+            // if no max parallelism was configured by the user, we calculate and set a default
+            final int maxParallelism =
+                    vertex.getMaxParallelism() == JobVertex.MAX_PARALLELISM_DEFAULT
+                            ? defaultMaxParallelismFunc.apply(vertex)
+                            : vertex.getMaxParallelism();
+            // If the parallelism has already been adjusted, respect what has been configured in the
+            // vertex. Otherwise, scale it to the max parallelism to attempt to be "as parallel as
+            // possible"
+            final int parallelism;
+            if (adjustParallelism) {
+                parallelism = maxParallelism;
+            } else {
+                parallelism = vertex.getParallelism();
+            }
+
+            VertexParallelismInformation parallelismInfo =
+                    new DefaultVertexParallelismInfo(
+                            parallelism,
+                            maxParallelism,
+                            // Allow rescaling if the new desired max parallelism
+                            // is not less than what was declared here during scheduling.
+                            // This prevents the situation where more resources are requested
+                            // based on the computed default, when actually fewer are necessary.
+                            (newMax) ->
+                                    newMax >= maxParallelism
+                                            ? Optional.empty()
+                                            : Optional.of(
+                                                    "Cannot lower max parallelism in Reactive mode."));
+            store.setParallelismInfo(vertex.getID(), parallelismInfo);
+        }
+
+        return store;
+    }
+
+    /**
+     * Creates the parallelism store that should be used for determining scheduling requirements,
+     * which may choose different parallelisms than set in the {@link JobGraph} depending on the
+     * execution mode.
+     *
+     * @param jobGraph The job graph for execution.
+     * @param executionMode The mode of scheduler execution.
+     * @return The parallelism store.
+     */
+    private static VertexParallelismStore computeVertexParallelismStore(
+            JobGraph jobGraph, SchedulerExecutionMode executionMode) {
+        if (executionMode == SchedulerExecutionMode.REACTIVE) {
+            return computeReactiveModeVertexParallelismStore(
+                    jobGraph.getVertices(), SchedulerBase::getDefaultMaxParallelism, true);
+        }
+        return SchedulerBase.computeVertexParallelismStore(jobGraph);
+    }
+
+    /**
+     * Creates the parallelism store that should be used to build the {@link ExecutionGraph}, which
+     * will respect the vertex parallelism of the passed {@link JobGraph} in all execution modes.
+     *
+     * @param jobGraph The job graph for execution.
+     * @param executionMode The mode of scheduler execution.
+     * @param defaultMaxParallelismFunc a function for computing a default max parallelism if none
+     *     is specified on a given vertex
+     * @return The parallelism store.
+     */
+    @VisibleForTesting
+    static VertexParallelismStore computeVertexParallelismStoreForExecution(
+            JobGraph jobGraph,
+            SchedulerExecutionMode executionMode,
+            Function<JobVertex, Integer> defaultMaxParallelismFunc) {
+        if (executionMode == SchedulerExecutionMode.REACTIVE) {
+            return computeReactiveModeVertexParallelismStore(
+                    jobGraph.getVertices(), defaultMaxParallelismFunc, false);
+        }
+        return SchedulerBase.computeVertexParallelismStore(
+                jobGraph.getVertices(), defaultMaxParallelismFunc);
     }
 
     private void newResourcesAvailable(Collection<? extends PhysicalSlot> physicalSlots) {
@@ -516,12 +642,11 @@ public class AdaptiveScheduler
     }
 
     @Override
-    public CompletableFuture<String> stopWithSavepoint(String targetDirectory, boolean terminate) {
+    public CompletableFuture<String> stopWithSavepoint(
+            @Nullable String targetDirectory, boolean terminate) {
         return state.tryCall(
-                        StateWithExecutionGraph.class,
-                        stateWithExecutionGraph ->
-                                stateWithExecutionGraph.stopWithSavepoint(
-                                        targetDirectory, terminate),
+                        Executing.class,
+                        executing -> executing.stopWithSavepoint(targetDirectory, terminate),
                         "stopWithSavepoint")
                 .orElse(
                         FutureUtils.completedExceptionally(
@@ -565,7 +690,7 @@ public class AdaptiveScheduler
     // ----------------------------------------------------------------
 
     @Override
-    public boolean hasEnoughResources(ResourceCounter desiredResources) {
+    public boolean hasDesiredResources(ResourceCounter desiredResources) {
         final Collection<? extends SlotInfo> allSlots =
                 declarativeSlotPool.getFreeSlotsInformation();
         ResourceCounter outstandingResources = desiredResources;
@@ -586,15 +711,21 @@ public class AdaptiveScheduler
         return outstandingResources.isEmpty();
     }
 
+    @Override
+    public boolean hasSufficientResources() {
+        return slotAllocator
+                .determineParallelism(jobInformation, declarativeSlotPool.getAllSlotsInformation())
+                .isPresent();
+    }
+
     private VertexParallelism determineParallelism(SlotAllocator slotAllocator)
-            throws JobExecutionException {
+            throws NoResourceAvailableException {
 
         return slotAllocator
                 .determineParallelism(jobInformation, declarativeSlotPool.getFreeSlotsInformation())
                 .orElseThrow(
                         () ->
-                                new JobExecutionException(
-                                        jobInformation.getJobID(),
+                                new NoResourceAvailableException(
                                         "Not enough resources available for scheduling."));
     }
 
@@ -606,6 +737,7 @@ public class AdaptiveScheduler
                 jobInformation.getName(),
                 jobStatus,
                 cause,
+                jobInformation.getCheckpointingSettings(),
                 initializationTimestamp);
     }
 
@@ -615,7 +747,12 @@ public class AdaptiveScheduler
         declarativeSlotPool.setResourceRequirements(desiredResources);
 
         transitionToState(
-                new WaitingForResources.Factory(this, LOG, desiredResources, this.resourceTimeout));
+                new WaitingForResources.Factory(
+                        this,
+                        LOG,
+                        desiredResources,
+                        this.initialResourceAllocationTimeout,
+                        this.resourceStabilizationTimeout));
     }
 
     private ResourceCounter calculateDesiredResources() {
@@ -628,10 +765,25 @@ public class AdaptiveScheduler
                 new ExecutionGraphHandler(
                         executionGraph, LOG, ioExecutor, componentMainThreadExecutor);
         final OperatorCoordinatorHandler operatorCoordinatorHandler =
-                new OperatorCoordinatorHandler(executionGraph, this::handleGlobalFailure);
+                new DefaultOperatorCoordinatorHandler(executionGraph, this::handleGlobalFailure);
         operatorCoordinatorHandler.initializeOperatorCoordinators(componentMainThreadExecutor);
         operatorCoordinatorHandler.startAllOperatorCoordinators();
 
+        transitionToState(
+                new Executing.Factory(
+                        executionGraph,
+                        executionGraphHandler,
+                        operatorCoordinatorHandler,
+                        LOG,
+                        this,
+                        userCodeClassLoader));
+    }
+
+    @Override
+    public void goToExecuting(
+            ExecutionGraph executionGraph,
+            ExecutionGraphHandler executionGraphHandler,
+            OperatorCoordinatorHandler operatorCoordinatorHandler) {
         transitionToState(
                 new Executing.Factory(
                         executionGraph,
@@ -702,6 +854,28 @@ public class AdaptiveScheduler
     }
 
     @Override
+    public CompletableFuture<String> goToStopWithSavepoint(
+            ExecutionGraph executionGraph,
+            ExecutionGraphHandler executionGraphHandler,
+            OperatorCoordinatorHandler operatorCoordinatorHandler,
+            CheckpointScheduling checkpointScheduling,
+            CompletableFuture<String> savepointFuture) {
+
+        StopWithSavepoint stopWithSavepoint =
+                transitionToState(
+                        new StopWithSavepoint.Factory(
+                                this,
+                                executionGraph,
+                                executionGraphHandler,
+                                operatorCoordinatorHandler,
+                                checkpointScheduling,
+                                LOG,
+                                userCodeClassLoader,
+                                savepointFuture));
+        return stopWithSavepoint.getOperationFuture();
+    }
+
+    @Override
     public void goToFinished(ArchivedExecutionGraph archivedExecutionGraph) {
         transitionToState(new Finished.Factory(this, archivedExecutionGraph, LOG));
     }
@@ -719,21 +893,37 @@ public class AdaptiveScheduler
 
     private CompletableFuture<CreatingExecutionGraph.ExecutionGraphWithVertexParallelism>
             createExecutionGraphWithAvailableResourcesAsync() {
-        final JobGraph adjustedJobGraph;
         final VertexParallelism vertexParallelism;
+        final VertexParallelismStore adjustedParallelismStore;
 
         try {
             vertexParallelism = determineParallelism(slotAllocator);
+            JobGraph adjustedJobGraph = jobInformation.copyJobGraph();
 
-            adjustedJobGraph = jobInformation.copyJobGraph();
             for (JobVertex vertex : adjustedJobGraph.getVertices()) {
-                vertex.setParallelism(vertexParallelism.getParallelism(vertex.getID()));
+                JobVertexID id = vertex.getID();
+
+                // use the determined "available parallelism" to use
+                // the resources we have access to
+                vertex.setParallelism(vertexParallelism.getParallelism(id));
             }
+
+            // use the originally configured max parallelism
+            // as the default for consistent runs
+            adjustedParallelismStore =
+                    computeVertexParallelismStoreForExecution(
+                            adjustedJobGraph,
+                            executionMode,
+                            (vertex) -> {
+                                VertexParallelismInformation vertexParallelismInfo =
+                                        initialParallelismStore.getParallelismInfo(vertex.getID());
+                                return vertexParallelismInfo.getMaxParallelism();
+                            });
         } catch (Exception exception) {
             return FutureUtils.completedExceptionally(exception);
         }
 
-        return createExecutionGraphAndRestoreStateAsync(adjustedJobGraph)
+        return createExecutionGraphAndRestoreStateAsync(adjustedParallelismStore)
                 .thenApply(
                         executionGraph ->
                                 CreatingExecutionGraph.ExecutionGraphWithVertexParallelism.create(
@@ -779,28 +969,30 @@ public class AdaptiveScheduler
     }
 
     private CompletableFuture<ExecutionGraph> createExecutionGraphAndRestoreStateAsync(
-            JobGraph adjustedJobGraph) {
+            VertexParallelismStore adjustedParallelismStore) {
         backgroundTask.abort();
 
         backgroundTask =
                 backgroundTask.runAfter(
-                        () -> createExecutionGraphAndRestoreState(adjustedJobGraph), ioExecutor);
+                        () -> createExecutionGraphAndRestoreState(adjustedParallelismStore),
+                        ioExecutor);
 
         return FutureUtils.switchExecutor(
                 backgroundTask.getResultFuture(), getMainThreadExecutor());
     }
 
     @Nonnull
-    private ExecutionGraph createExecutionGraphAndRestoreState(JobGraph adjustedJobGraph)
-            throws Exception {
+    private ExecutionGraph createExecutionGraphAndRestoreState(
+            VertexParallelismStore adjustedParallelismStore) throws Exception {
         return executionGraphFactory.createAndRestoreExecutionGraph(
-                adjustedJobGraph,
+                jobInformation.copyJobGraph(),
                 completedCheckpointStore,
                 checkpointsCleaner,
                 checkpointIdCounter,
                 TaskDeploymentDescriptorFactory.PartitionLocationConstraint.MUST_BE_KNOWN,
                 initializationTimestamp,
                 vertexAttemptNumberStore,
+                adjustedParallelismStore,
                 LOG);
     }
 
@@ -843,14 +1035,24 @@ public class AdaptiveScheduler
 
     @Override
     public void onFinished(ArchivedExecutionGraph archivedExecutionGraph) {
+
+        @Nullable
+        final Throwable optionalFailure =
+                archivedExecutionGraph.getFailureInfo() != null
+                        ? archivedExecutionGraph.getFailureInfo().getException()
+                        : null;
+        LOG.info(
+                "Job {} reached terminal state {}.",
+                archivedExecutionGraph.getJobID(),
+                archivedExecutionGraph.getState(),
+                optionalFailure);
+
         if (jobStatusListener != null) {
             jobStatusListener.jobStatusChanges(
                     jobInformation.getJobID(),
                     archivedExecutionGraph.getState(),
                     archivedExecutionGraph.getStatusTimestamp(archivedExecutionGraph.getState()),
-                    archivedExecutionGraph.getFailureInfo() != null
-                            ? archivedExecutionGraph.getFailureInfo().getException()
-                            : null);
+                    optionalFailure);
         }
 
         jobTerminationFuture.complete(archivedExecutionGraph.getState());
@@ -866,7 +1068,7 @@ public class AdaptiveScheduler
         restartBackoffTimeStrategy.notifyFailure(failure);
         if (restartBackoffTimeStrategy.canRestart()) {
             return Executing.FailureResult.canRestart(
-                    Duration.ofMillis(restartBackoffTimeStrategy.getBackoffTime()));
+                    failure, Duration.ofMillis(restartBackoffTimeStrategy.getBackoffTime()));
         } else {
             return Executing.FailureResult.canNotRestart(
                     new JobException(
@@ -908,9 +1110,17 @@ public class AdaptiveScheduler
 
     // ----------------------------------------------------------------
 
-    /** Note: Do not call this method from a State constructor or State#onLeave. */
+    /**
+     * Transition the scheduler to another state. This method guards against state transitions while
+     * there is already a transition ongoing. This effectively means that you can not call this
+     * method from a State constructor or State#onLeave.
+     *
+     * @param targetState State to transition to
+     * @param <T> Type of the target state
+     * @return A target state instance
+     */
     @VisibleForTesting
-    void transitionToState(StateFactory<?> targetState) {
+    <T extends State> T transitionToState(StateFactory<T> targetState) {
         Preconditions.checkState(
                 !isTransitioningState,
                 "State transitions must not be triggered while another state transition is in progress.");
@@ -926,7 +1136,9 @@ public class AdaptiveScheduler
                     targetState.getStateClass().getSimpleName());
 
             state.onLeave(targetState.getStateClass());
-            state = targetState.getState();
+            T targetStateInstance = targetState.getState();
+            state = targetStateInstance;
+            return targetStateInstance;
         } finally {
             isTransitioningState = false;
         }

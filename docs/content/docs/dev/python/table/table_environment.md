@@ -35,28 +35,25 @@ Create a TableEnvironment
 The recommended way to create a `TableEnvironment` is to create from an `EnvironmentSettings` object:
 
 ```python
-
 from pyflink.table import EnvironmentSettings, TableEnvironment
 
 # create a streaming TableEnvironment
-env_settings = EnvironmentSettings.new_instance().in_streaming_mode().build()
-# or a batch TableEnvironment
-# env_settings = EnvironmentSettings.new_instance().in_batch_mode().build()
-table_env = TableEnvironment.create(env_settings)
+env_settings = EnvironmentSettings.in_streaming_mode()
 
+# or a batch TableEnvironment
+# env_settings = EnvironmentSettings.in_batch_mode()
+table_env = TableEnvironment.create(env_settings)
 ```
 
-Alternatively, users can create a StreamTableEnvironment from an existing StreamExecutionEnvironment to interoperate with the DataStream API.
+Alternatively, users can create a `StreamTableEnvironment` from an existing `StreamExecutionEnvironment` to interoperate with the DataStream API.
 
 ```python
-
 from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.table import StreamTableEnvironment, BatchTableEnvironment, TableConfig
+from pyflink.table import StreamTableEnvironment
 
 # create a blink streaming TableEnvironment from a StreamExecutionEnvironment
 env = StreamExecutionEnvironment.get_execution_environment()
 table_env = StreamTableEnvironment.create(env)
-
 ```
 
 TableEnvironment API
@@ -514,7 +511,7 @@ For more details about the different kinds of UDFs, please refer to [User Define
 ### Dependency Management
 
 These APIs are used to manage the Python dependencies which are required by the Python UDFs.
-Please refer to the [Dependency Management]({{< ref "docs/dev/python/table/dependency_management" >}}#python-dependency-in-python-program) documentation for more details.
+Please refer to the [Dependency Management]({{< ref "docs/dev/python/dependency_management" >}}#python-dependencies) documentation for more details.
 
 <table class="table table-bordered">
   <thead>
@@ -703,6 +700,17 @@ These APIs are used to access catalogs and modules. You can find more detailed i
     </tr>
     <tr>
       <td>
+        <strong>use_modules(*module_names)</strong>
+      </td>
+      <td>
+        Enables and changes the resolution order of loaded modules.
+      </td>
+      <td class="text-center">
+        {{< pythondoc file="pyflink.table.html#pyflink.table.TableEnvironment.use_modules" name="link">}}
+      </td>
+    </tr>
+    <tr>
+      <td>
         <strong>list_catalogs()</strong>
       </td>
       <td>
@@ -721,6 +729,17 @@ These APIs are used to access catalogs and modules. You can find more detailed i
       </td>
       <td class="text-center">
         {{< pythondoc file="pyflink.table.html#pyflink.table.TableEnvironment.list_modules" name="link">}}
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <strong>list_full_modules()</strong>
+      </td>
+      <td>
+        Gets the names of all loaded modules (including disabled modules) registered in this environment.
+      </td>
+      <td class="text-center">
+        {{< pythondoc file="pyflink.table.html#pyflink.table.TableEnvironment.list_full_modules" name="link">}}
       </td>
     </tr>
     <tr>

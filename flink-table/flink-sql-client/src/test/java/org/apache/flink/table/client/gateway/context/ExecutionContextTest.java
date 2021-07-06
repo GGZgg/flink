@@ -20,6 +20,7 @@ package org.apache.flink.table.client.gateway.context;
 
 import org.apache.flink.client.cli.DefaultCLI;
 import org.apache.flink.client.python.PythonFunctionFactory;
+import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.configuration.PipelineOptions;
@@ -63,7 +64,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -298,8 +298,7 @@ public class ExecutionContextTest {
     @Test
     public void testTemporalTables() throws Exception {
         final ExecutionContext context = createStreamingExecutionContext();
-        final StreamTableEnvironment tableEnv =
-                (StreamTableEnvironment) context.getTableEnvironment();
+        final StreamTableEnvironment tableEnv = context.getTableEnvironment();
 
         assertArrayEquals(
                 new String[] {
@@ -391,7 +390,6 @@ public class ExecutionContextTest {
 
     private Map<String, String> createDefaultReplaceVars() {
         Map<String, String> replaceVars = new HashMap<>();
-        replaceVars.put("$VAR_PLANNER", "old");
         replaceVars.put("$VAR_EXECUTION_TYPE", "streaming");
         replaceVars.put("$VAR_RESULT_MODE", "changelog");
         replaceVars.put("$VAR_UPDATE_MODE", "update-mode: append");
@@ -402,7 +400,6 @@ public class ExecutionContextTest {
 
     static Map<String, String> createModuleReplaceVars() {
         Map<String, String> replaceVars = new HashMap<>();
-        replaceVars.put("$VAR_PLANNER", "blink");
         replaceVars.put("$VAR_EXECUTION_TYPE", "streaming");
         replaceVars.put("$VAR_RESULT_MODE", "changelog");
         replaceVars.put("$VAR_UPDATE_MODE", "update-mode: append");
@@ -421,7 +418,6 @@ public class ExecutionContextTest {
 
     private ExecutionContext createCatalogExecutionContext() throws Exception {
         final Map<String, String> replaceVars = new HashMap<>();
-        replaceVars.put("$VAR_PLANNER", "old");
         replaceVars.put("$VAR_EXECUTION_TYPE", "streaming");
         replaceVars.put("$VAR_RESULT_MODE", "changelog");
         replaceVars.put("$VAR_UPDATE_MODE", "update-mode: append");
@@ -493,20 +489,23 @@ public class ExecutionContextTest {
     public static class TestClassLoaderCatalogFactory implements CatalogFactory {
 
         @Override
-        public Catalog createCatalog(String name, Map<String, String> properties) {
+        public String factoryIdentifier() {
+            return "test_cl_catalog";
+        }
+
+        @Override
+        public Set<ConfigOption<?>> requiredOptions() {
+            return Collections.emptySet();
+        }
+
+        @Override
+        public Set<ConfigOption<?>> optionalOptions() {
+            return Collections.emptySet();
+        }
+
+        @Override
+        public Catalog createCatalog(Context context) {
             return new TestClassLoaderCatalog("test_cl");
-        }
-
-        @Override
-        public Map<String, String> requiredContext() {
-            Map<String, String> context = new HashMap<>();
-            context.put("type", "test_cl_catalog");
-            return context;
-        }
-
-        @Override
-        public List<String> supportedProperties() {
-            return Collections.emptyList();
         }
     }
 }

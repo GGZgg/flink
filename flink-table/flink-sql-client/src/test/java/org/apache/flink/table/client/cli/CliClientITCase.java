@@ -36,6 +36,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.jline.reader.MaskingCallback;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.impl.DumbTerminal;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Test;
@@ -72,8 +73,6 @@ import static org.junit.Assert.assertEquals;
 @RunWith(Parameterized.class)
 public class CliClientITCase extends AbstractTestBase {
 
-    // a generated UDF jar used for testing classloading of dependencies
-    private static URL udfDependency;
     private static Path historyPath;
     private static Map<String, String> replaceVars;
 
@@ -101,17 +100,25 @@ public class CliClientITCase extends AbstractTestBase {
         File udfJar =
                 TestUserClassLoaderJar.createJarFile(
                         tempFolder.newFolder("test-jar"), "test-classloader-udf.jar");
-        udfDependency = udfJar.toURI().toURL();
+        URL udfDependency = udfJar.toURI().toURL();
         historyPath = tempFolder.newFile("history").toPath();
 
         replaceVars = new HashMap<>();
-        replaceVars.put("$VAR_PIPELINE_JARS", udfDependency.toString());
+        replaceVars.put("$VAR_UDF_JAR_PATH", udfDependency.getPath());
+        replaceVars.put("$VAR_PIPELINE_JARS_URL", udfDependency.toString());
         replaceVars.put(
                 "$VAR_REST_PORT",
                 miniClusterResource.getClientConfiguration().get(PORT).toString());
         replaceVars.put(
                 "$VAR_JOBMANAGER_RPC_ADDRESS",
                 miniClusterResource.getClientConfiguration().get(ADDRESS));
+    }
+
+    @Before
+    public void before() throws IOException {
+        // initialize new folders for every tests, so the vars can be reused by every SQL scripts
+        replaceVars.put("$VAR_STREAMING_PATH", tempFolder.newFolder().toPath().toString());
+        replaceVars.put("$VAR_BATCH_PATH", tempFolder.newFolder().toPath().toString());
     }
 
     @Test
@@ -137,7 +144,7 @@ public class CliClientITCase extends AbstractTestBase {
         DefaultContext defaultContext =
                 new DefaultContext(
                         new Environment(),
-                        Collections.singletonList(udfDependency),
+                        Collections.emptyList(),
                         new Configuration(miniClusterResource.getClientConfiguration()),
                         Collections.singletonList(new DefaultCLI()));
         final Executor executor = new LocalExecutor(defaultContext);
@@ -148,12 +155,12 @@ public class CliClientITCase extends AbstractTestBase {
         try (Terminal terminal = new DumbTerminal(inputStream, outputStream);
                 CliClient client =
                         new CliClient(
-                                terminal,
+                                () -> terminal,
                                 sessionId,
                                 executor,
                                 historyPath,
                                 HideSqlStatement.INSTANCE)) {
-            client.open();
+            client.executeInInteractiveMode();
             String output = new String(outputStream.toByteArray());
             return normalizeOutput(output);
         }
@@ -164,6 +171,7 @@ public class CliClientITCase extends AbstractTestBase {
     // -------------------------------------------------------------------------------------------
 
     private static final String PROMOTE = "Flink SQL> ";
+    private static final String JOB_ID = "Job ID:";
 
     enum Tag {
         ERROR("\u001B[31;1m", "\u001B[0m", "!error"),
@@ -245,7 +253,12 @@ public class CliClientITCase extends AbstractTestBase {
                     // remove the promote prefix
                     line = line.substring(PROMOTE.length());
                 }
-                contentLines.add(line);
+                // ignore the line begin with Job ID:
+                if (!line.startsWith(JOB_ID)) {
+                    contentLines.add(line);
+                } else {
+                    contentLines.add(JOB_ID);
+                }
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
